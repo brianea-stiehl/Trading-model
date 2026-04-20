@@ -3,6 +3,8 @@ prism/data/fred.py
 FRED (Federal Reserve Economic Data) macro fetcher.
 API key: env var FRED_API_KEY (free at fred.stlouisfed.org)
 """
+from __future__ import annotations
+
 import os
 import logging
 from pathlib import Path
@@ -59,6 +61,14 @@ class FREDClient:
     def get_macro_features(self, start_date: str, end_date: str) -> pd.DataFrame:
         """
         Build combined macro feature DataFrame, daily frequency.
+
+        Derived features (cpi_yoy, gdp_growth) are computed on the RAW native
+        frequencies (CPI is monthly, GDP is quarterly) and then forward-filled
+        onto the daily panel. The previous implementation computed pct_change
+        on the ffilled daily series, which happened to approximate YoY only
+        because the ffilled value stays constant for ~21 trading days — fragile
+        and wrong if any row of the daily panel is missing.
+
         Columns: fed_funds_rate, fed_funds_delta_wk, sofr, cpi_yoy,
                  gdp_growth, unemployment_rate, yield_10y, yield_2y,
                  yield_spread, dxy, dxy_return_5d, vix
@@ -71,20 +81,37 @@ class FREDClient:
         df = pd.DataFrame(index=date_range)
         df.index.name = "date"
 
-        # Fetch each series and reindex to daily (forward-fill)
+        # Stash raw series for derived features that must be computed at native
+        # frequency (e.g. YoY CPI from monthly observations).
+        raw: dict = {}
+
         for col, series_id in SERIES.items():
             s = self.get_series(series_id, start_date, end_date)
             if s.empty:
                 df[col] = float("nan")
                 continue
-            s = s.set_index("date")["value"]
-            s = s.reindex(date_range).ffill()
-            df[col] = s.values
+            s_raw = s.set_index("date")["value"].sort_index()
+            raw[col] = s_raw
+            df[col] = s_raw.reindex(date_range).ffill().values
 
-        # Derived features
-        df["fed_funds_delta_wk"] = df["fed_funds_rate"].diff(5)  # 5-day delta
-        df["cpi_yoy"] = df["cpi"].pct_change(252) * 100           # ~1 year
-        df["gdp_growth"] = df["gdp"].pct_change(63) * 100         # ~1 quarter
+        # --- Derived features ---
+        # Fed funds 5-day delta: daily panel is fine (rate is daily/weekly).
+        df["fed_funds_delta_wk"] = df["fed_funds_rate"].diff(5)
+
+        # CPI YoY: compute on the raw monthly series, then ffill to daily.
+        if "cpi" in raw:
+            cpi_yoy = raw["cpi"].pct_change(12) * 100   # 12 months = YoY
+            df["cpi_yoy"] = cpi_yoy.reindex(date_range).ffill().values
+        else:
+            df["cpi_yoy"] = float("nan")
+
+        # GDP growth: compute on the raw quarterly series, then ffill to daily.
+        if "gdp" in raw:
+            gdp_growth = raw["gdp"].pct_change(1) * 100  # 1 quarter = QoQ
+            df["gdp_growth"] = gdp_growth.reindex(date_range).ffill().values
+        else:
+            df["gdp_growth"] = float("nan")
+
         df["yield_spread"] = df["yield_10y"] - df["yield_2y"]
         df["dxy_return_5d"] = df["dxy"].pct_change(5) * 100
         df = df.drop(columns=["cpi", "gdp"], errors="ignore")

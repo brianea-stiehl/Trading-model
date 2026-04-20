@@ -124,12 +124,21 @@ class PRISMFeaturePipeline:
             df["session"] = _session(pd.DatetimeIndex(df["datetime"])).values
         df["day_of_week"] = pd.to_datetime(df["datetime"]).dt.dayofweek
 
+        # Build a tz-naive midnight date key for merging against daily macro /
+        # sentiment data. df["datetime"] is tz-aware UTC (from Tiingo FX/IEX
+        # and the yfinance fallback); macro/cot/fear-greed dates are naive.
+        # Merging a tz-aware key against a tz-naive one raises
+        # "trying to merge on datetime64[ns, UTC] and datetime64[ns]" — so we
+        # strip tz first and reuse the naive key for every merge below.
+        _dt_utc = pd.to_datetime(df["datetime"], utc=True)
+        _date_key = _dt_utc.dt.tz_localize(None).dt.normalize()
+
         # --- Macro features (FRED) ---
         try:
             from prism.data.fred import get_macro_features
             macro = get_macro_features(start_date, end_date)
-            macro["date"] = pd.to_datetime(macro["date"])
-            df["date"] = pd.to_datetime(df["datetime"]).dt.normalize()
+            macro["date"] = pd.to_datetime(macro["date"]).dt.tz_localize(None)
+            df["date"] = _date_key
             df = df.merge(macro, on="date", how="left")
             df = df.drop(columns=["date"], errors="ignore")
             for col in macro.columns:
@@ -146,15 +155,15 @@ class PRISMFeaturePipeline:
             from prism.data.quiver import get_cot_report, get_fear_greed
             cot = get_cot_report(self.instrument)
             if not cot.empty:
-                cot["date"] = pd.to_datetime(cot["date"])
-                df["date"] = pd.to_datetime(df["datetime"]).dt.normalize()
+                cot["date"] = pd.to_datetime(cot["date"]).dt.tz_localize(None)
+                df["date"] = _date_key
                 df = df.merge(cot[["date", "net_speculative"]], on="date", how="left")
                 df["cot_net_speculative"] = df["net_speculative"].ffill()
                 df = df.drop(columns=["date", "net_speculative"], errors="ignore")
             fg = get_fear_greed()
             if not fg.empty:
-                fg["date"] = pd.to_datetime(fg["date"])
-                df["date"] = pd.to_datetime(df["datetime"]).dt.normalize()
+                fg["date"] = pd.to_datetime(fg["date"]).dt.tz_localize(None)
+                df["date"] = _date_key
                 df = df.merge(fg, on="date", how="left")
                 df["fear_greed"] = df["fear_greed"].ffill()
                 df = df.drop(columns=["date"], errors="ignore")
@@ -165,8 +174,12 @@ class PRISMFeaturePipeline:
 
         # --- Target variables ---
         # direction_fwd_4: sign of close 4 bars forward vs current close
-        # (timeframe-agnostic — '4 bars ahead' on whatever pipeline timeframe is configured, not necessarily 4 hours)
-        df["direction_fwd_4"] = np.sign(close.shift(-4) - close).astype(int)
+        # (timeframe-agnostic — '4 bars ahead' on whatever pipeline timeframe
+        # is configured, not necessarily 4 hours). The last 4 rows have no
+        # future bar so np.sign returns NaN; keep as float here and let the
+        # downstream dropna(subset=["direction_fwd_4"]) remove them. Modern
+        # pandas raises IntCastingNaNError if we try to astype(int) first.
+        df["direction_fwd_4"] = np.sign(close.shift(-4) - close)
         # magnitude: max favorable excursion next 20 bars (in pips)
         df["magnitude_pips"] = 0.0
         for i in range(len(df) - 20):
@@ -176,8 +189,9 @@ class PRISMFeaturePipeline:
             else:
                 df.at[df.index[i], "magnitude_pips"] = (close.iloc[i] - future["low"].min()) / self.pip_size
 
-        # Drop rows with NaN targets
+        # Drop rows with NaN targets, THEN cast to int — safe because NaN is gone.
         df = df.dropna(subset=["direction_fwd_4"]).reset_index(drop=True)
+        df["direction_fwd_4"] = df["direction_fwd_4"].astype(int)
 
         # Store feature columns (exclude datetime, targets, raw OHLCV)
         exclude = {"datetime", "open", "high", "low", "close", "volume",
@@ -209,11 +223,22 @@ class PRISMFeaturePipeline:
             if raw.empty:
                 return pd.DataFrame()
             raw = raw.reset_index()
-            raw.columns = [c.lower() for c in raw.columns]
+
+            # yfinance >= 0.2.x returns a MultiIndex on columns when a single
+            # ticker is passed as a string (e.g. [("Close", "EURUSD=X"), ...]).
+            # Flatten to the field name only before lowercasing.
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = [c[0] if isinstance(c, tuple) else c
+                               for c in raw.columns]
+            raw.columns = [str(c).lower() for c in raw.columns]
+
             raw = raw.rename(columns={"index": "datetime", "date": "datetime",
                                        "datetime": "datetime"})
             raw["datetime"] = pd.to_datetime(raw["datetime"])
-            return raw[["datetime", "open", "high", "low", "close"]].copy()
+            cols = ["datetime", "open", "high", "low", "close"]
+            if "volume" in raw.columns:
+                cols.append("volume")
+            return raw[cols].copy()
         except Exception as e:
             logger.error(f"yfinance also failed: {e}")
             return pd.DataFrame()

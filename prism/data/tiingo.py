@@ -3,6 +3,8 @@ prism/data/tiingo.py
 Tiingo API price data fetcher.
 API key: env var TIINGO_API_KEY
 """
+from __future__ import annotations
+
 import os
 import time
 import logging
@@ -13,16 +15,32 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Instrument mapping: MT5 symbol -> Tiingo ticker
-INSTRUMENT_MAP = {
-    # NOTE: XAUUSD mapped to GLD (SPDR Gold ETF) as Tiingo proxy for spot gold.
-    # GLD tracks spot XAU/USD closely but has minor ETF-specific dynamics.
-    # Switch to "XAUUSD=X" via yfinance for spot-accurate data (see get_ohlcv fallback).
-    "XAUUSD": "GLD",
-    "EURUSD": "EURUSD", # Tiingo forex
-    "GBPUSD": "GBPUSD",
-    "USDJPY": "USDJPY",
+# Single source of truth for instrument routing. Each entry is
+#     SYMBOL -> (tiingo_ticker, endpoint_kind)
+# where `endpoint_kind` is either:
+#     "fx"     -> /tiingo/fx/{ticker}/prices  (daily & intraday — resampleFreq=1day | 1hour | ...)
+#     "equity" -> /tiingo/daily/{ticker}/prices  (daily)
+#                 /iex/{ticker}/prices          (intraday — IEX, equities-only)
+#
+# Never maintain _FX_INSTRUMENTS / INSTRUMENT_MAP / YF_MAP as independent
+# lookup tables — they drift (e.g. adding AUDUSD to one but not the other
+# silently routes requests to the wrong endpoint). Derive everything below
+# from this single map.
+#
+# XAUUSD is proxied by GLD (SPDR Gold ETF) because Tiingo doesn't expose spot
+# gold directly. For spot-accurate gold bars, use the yfinance fallback
+# ("GC=F" gold futures) — see YF_MAP.
+INSTRUMENT_ROUTING: dict = {
+    # symbol -> (tiingo_ticker, endpoint_kind)
+    "XAUUSD": ("GLD",    "equity"),
+    "EURUSD": ("eurusd", "fx"),   # Tiingo FX tickers are lowercase per docs
+    "GBPUSD": ("gbpusd", "fx"),
+    "USDJPY": ("usdjpy", "fx"),
 }
+
+# Derived lookup tables — DO NOT edit directly, edit INSTRUMENT_ROUTING.
+INSTRUMENT_MAP: dict = {sym: ticker for sym, (ticker, _) in INSTRUMENT_ROUTING.items()}
+_FX_INSTRUMENTS: set = {sym for sym, (_, kind) in INSTRUMENT_ROUTING.items() if kind == "fx"}
 
 
 # yfinance ticker overrides — used when Tiingo is unavailable.
@@ -71,6 +89,7 @@ class TiingoClient:
         Returns DataFrame with columns: datetime, open, high, low, close, volume
         """
         ticker = INSTRUMENT_MAP.get(symbol, symbol.lower())
+        is_fx = symbol in _FX_INSTRUMENTS
         cache_file = CACHE_DIR / f"tiingo_{ticker}_{timeframe}_{start_date}_{end_date}.parquet"
 
         if cache_file.exists():
@@ -78,19 +97,34 @@ class TiingoClient:
             return pd.read_parquet(cache_file)
 
         try:
-            if timeframe == "daily":
+            freq_map = {
+                "1hour": "1hour", "4hour": "4hour",
+                "15min": "15min", "5min": "5min", "1min": "1min",
+            }
+            resample = freq_map.get(timeframe, "1hour")
+
+            if is_fx:
+                # Tiingo FX endpoint covers both daily and intraday (resampleFreq=1day
+                # for daily bars, or {1min,5min,15min,1hour,4hour} for intraday).
+                params = {
+                    "startDate": start_date,
+                    "endDate": end_date,
+                    "resampleFreq": "1day" if timeframe == "daily" else resample,
+                }
+                data = self._get(f"tiingo/fx/{ticker}/prices", params)
+            elif timeframe == "daily":
                 data = self._get(
                     f"tiingo/daily/{ticker}/prices",
                     {"startDate": start_date, "endDate": end_date, "format": "json"},
                 )
             else:
-                freq_map = {"1hour": "1Hour", "4hour": "4Hour", "15min": "15Min", "5min": "5Min", "1min": "1Min"}
+                # Equity intraday via IEX — only valid for equity tickers (e.g. GLD).
                 data = self._get(
                     f"iex/{ticker}/prices",
                     {
                         "startDate": start_date,
                         "endDate": end_date,
-                        "resampleFreq": freq_map.get(timeframe, "1Hour"),
+                        "resampleFreq": resample,
                         "columns": "open,high,low,close,volume",
                     },
                 )
@@ -100,12 +134,19 @@ class TiingoClient:
                 logger.warning(f"No data returned for {ticker}")
                 return df
 
-            # Select adjusted columns only to avoid duplicate column names
-            col_map = {"date": "datetime", "adjOpen": "open",
+            # Prefer adjusted columns (equity daily), fall back to raw OHLCV
+            # (FX and intraday responses have no adj* fields).
+            adj_map = {"date": "datetime", "adjOpen": "open",
                        "adjHigh": "high", "adjLow": "low",
                        "adjClose": "close", "adjVolume": "volume"}
-            keep = [c for c in col_map if c in df.columns]
-            df = df[keep].rename(columns=col_map)
+            raw_map = {"date": "datetime", "open": "open", "high": "high",
+                       "low": "low", "close": "close", "volume": "volume"}
+            if "adjClose" in df.columns:
+                keep = [c for c in adj_map if c in df.columns]
+                df = df[keep].rename(columns=adj_map)
+            else:
+                keep = [c for c in raw_map if c in df.columns]
+                df = df[keep].rename(columns=raw_map)
 
             df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
             df = df.sort_values("datetime").reset_index(drop=True)

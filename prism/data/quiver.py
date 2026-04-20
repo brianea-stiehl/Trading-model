@@ -4,6 +4,8 @@ Alternative data: CFTC COT reports, Fear & Greed, Quiver Quantitative.
 QUIVER_API_KEY env var (free tier at quiverquant.com)
 COT data is public — no key required.
 """
+from __future__ import annotations
+
 import os
 import io
 import logging

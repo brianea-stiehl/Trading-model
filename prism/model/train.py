@@ -40,7 +40,7 @@ DIRECTION_RMAP = {0: -1, 1: 0, 2: 1}          # inverse
 @dataclass
 class TrainingResult:
     instrument: str
-    layer: str                        # "layer1_xgb" | "layer1_lgbm" | "layer2" | "layer3"
+    layer: str                        # "layer1_xgb" | "layer1_lgb" | "layer2_magnitude" | "layer3_confidence"
     train_accuracy: float
     test_accuracy: float
     f1_macro: float
@@ -145,7 +145,7 @@ class PRISMTrainer:
             if col in df.columns:
                 df[col] = df[col].fillna(0)
 
-        df = df.dropna(subset=["direction_4h", "magnitude_pips"]).reset_index(drop=True)
+        df = df.dropna(subset=["direction_fwd_4", "magnitude_pips"]).reset_index(drop=True)
 
         X_train_df, X_test_df, y_train_dir, y_test_dir = pipeline.split_train_test(df)
 
@@ -172,7 +172,7 @@ class PRISMTrainer:
         ))
 
         # ---- Layer 2: XGBRegressor ----
-        results.append(self._train_layer2_regressor(
+        results.append(self._train_layer2_magnitude(
             X_train, X_test, y_train_reg, y_test_reg, X_train_df, feature_cols
         ))
 
@@ -273,16 +273,18 @@ class PRISMTrainer:
         f1 = f1_score(y_test, test_pred, average="macro", zero_division=0)
         overfit = (train_acc - test_acc) > OVERFIT_THRESHOLD
 
-        path = str(MODELS_DIR / f"layer1_lgbm_{self.instrument}.joblib")
+        # NB: filename must match PRISMPredictor._load("layer1_lgb") — the
+        # predictor loads layer1_lgb_{instrument}.joblib, not layer1_lgbm_.
+        path = str(MODELS_DIR / f"layer1_lgb_{self.instrument}.joblib")
         joblib.dump(model, path)
         logger.info(f"Saved → {path}")
 
         importance = dict(zip(feature_cols, model.feature_importances_.tolist()))
-        _run_shap(model, pd.DataFrame(X_train, columns=feature_cols), self.instrument, "layer1_lgbm")
+        _run_shap(model, pd.DataFrame(X_train, columns=feature_cols), self.instrument, "layer1_lgb")
 
         return TrainingResult(
             instrument=self.instrument,
-            layer="layer1_lgbm",
+            layer="layer1_lgb",
             train_accuracy=train_acc,
             test_accuracy=test_acc,
             f1_macro=f1,
@@ -291,7 +293,7 @@ class PRISMTrainer:
             overfit_flag=overfit,
         )
 
-    def _train_layer2_regressor(
+    def _train_layer2_magnitude(
         self, X_train, X_test, y_train, y_test, X_df, feature_cols
     ) -> TrainingResult:
         logger.info("Training Layer 2 — XGBRegressor (magnitude pips)")
@@ -321,16 +323,17 @@ class PRISMTrainer:
         test_acc = max(0.0, float(r2_score(y_test, test_pred)))
         overfit = (train_acc - test_acc) > OVERFIT_THRESHOLD
 
-        path = str(MODELS_DIR / f"layer2_reg_{self.instrument}.joblib")
+        # NB: filename must match PRISMPredictor._load("layer2_magnitude").
+        path = str(MODELS_DIR / f"layer2_magnitude_{self.instrument}.joblib")
         joblib.dump(model, path)
         logger.info(f"Saved → {path}")
 
         importance = dict(zip(feature_cols, model.feature_importances_.tolist()))
-        _run_shap(model, pd.DataFrame(X_train, columns=feature_cols), self.instrument, "layer2_reg")
+        _run_shap(model, pd.DataFrame(X_train, columns=feature_cols), self.instrument, "layer2_magnitude")
 
         return TrainingResult(
             instrument=self.instrument,
-            layer="layer2_regressor",
+            layer="layer2_magnitude",
             train_accuracy=train_acc,
             test_accuracy=test_acc,
             f1_macro=0.0,          # N/A for regression
@@ -368,7 +371,8 @@ class PRISMTrainer:
         f1 = f1_score(conf_test, test_pred, average="macro", zero_division=0)
         overfit = (train_acc - test_acc) > OVERFIT_THRESHOLD
 
-        path = str(MODELS_DIR / f"layer3_rf_{self.instrument}.joblib")
+        # NB: filename must match PRISMPredictor._load("layer3_confidence").
+        path = str(MODELS_DIR / f"layer3_confidence_{self.instrument}.joblib")
         joblib.dump(model, path)
         logger.info(f"Saved → {path}")
 
