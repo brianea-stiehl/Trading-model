@@ -144,6 +144,7 @@ class MT5Bridge:
         self._reconnect_attempts: int = 0
         self._next_reconnect_at: Optional[datetime] = None
         self._disconnect_alert_sent: bool = False
+        self._reconnect_just_happened: bool = False  # flag cleared after caller reads it
         self.reconnect_base_cooldown_sec = (
             reconnect_base_cooldown_sec
             or int(os.environ.get("PRISM_MT5_RECONNECT_BASE_SEC",
@@ -288,6 +289,7 @@ class MT5Bridge:
                 self._reconnect_attempts = 0
                 self._next_reconnect_at = None
                 self._disconnect_alert_sent = False
+                self._reconnect_just_happened = True
             self._connected = True
             return True
 
@@ -326,6 +328,7 @@ class MT5Bridge:
             self._reconnect_attempts = 0
             self._next_reconnect_at = None
             self._disconnect_alert_sent = False
+            self._reconnect_just_happened = True
             return True
 
         # Still dead — schedule next attempt with exponential backoff,
@@ -359,6 +362,19 @@ class MT5Bridge:
     def mark_disconnect_alert_sent(self) -> None:
         """Callers invoke this after posting the disconnect alert."""
         self._disconnect_alert_sent = True
+
+    def pop_reconnect_event(self) -> bool:
+        """Returns True once (and resets) when a reconnect just succeeded.
+
+        Call this right after ensure_connected(). If True, send a Slack
+        recovery alert. Design: the bridge sets this flag when
+        ensure_connected() successfully reconnects (transitions from
+        disconnected → connected). The runner calls pop_reconnect_event()
+        and owns the Slack notification.
+        """
+        val = self._reconnect_just_happened
+        self._reconnect_just_happened = False
+        return val
 
     def get_account_balance(self) -> float:
         if not self._connected:
@@ -821,6 +837,10 @@ class MockMT5Bridge(MT5Bridge):
     def ensure_connected(self, now=None) -> bool:
         """Mock is always 'connected' — reconnect semantics are a live-bridge concern."""
         return True
+
+    def pop_reconnect_event(self) -> bool:
+        """Mock bridge never has a reconnect event (it's always connected)."""
+        return False
 
     def should_alert_disconnect(self, now=None) -> bool:
         return False

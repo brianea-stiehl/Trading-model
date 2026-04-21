@@ -18,6 +18,7 @@ Environment variables:
     PRISM_INSTRUMENTS     -- comma-separated, default: XAUUSD,EURUSD,GBPUSD
     PRISM_SCAN_INTERVAL   -- seconds between scans, default: 60
 """
+import json
 import logging
 import os
 import signal as signal_module
@@ -179,6 +180,35 @@ _DEMO_WARNING = (
 _last_signal_key: dict = {}
 
 
+def _load_inflight_keys(state_dir: Path) -> dict:
+    """Rehydrate in-flight dedup keys from disk. Returns {} on miss/corrupt.
+
+    JSON serialises tuples as lists; this function converts them back to
+    tuples so equality checks against _signal_key() results work correctly.
+    """
+    path = state_dir / "in_flight_keys.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        if isinstance(data, dict):
+            # Restore tuples that JSON serialised as lists
+            return {k: tuple(v) if isinstance(v, list) else v for k, v in data.items()}
+    except Exception as e:
+        logger.warning("Corrupt in_flight_keys state at %s: %s — starting fresh", path, e)
+    return {}
+
+
+def _persist_inflight_keys(state_dir: Path) -> None:
+    """Write current in-flight keys to disk."""
+    path = state_dir / "in_flight_keys.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_last_signal_key, indent=2))
+    except Exception as e:
+        logger.warning("Failed to persist in_flight_keys: %s", e)
+
+
 def _signal_key(instrument: str, signal, h4_df) -> tuple:
     """Build the dedup key for an (instrument, signal, H4 bar) tuple."""
     try:
@@ -188,12 +218,21 @@ def _signal_key(instrument: str, signal, h4_df) -> tuple:
     return (instrument, signal.direction, last_h4)
 
 
-def _should_fire(instrument: str, signal, h4_df) -> bool:
-    """Return True if this signal is not a repeat of the last one we fired."""
+def _should_fire(instrument: str, signal, h4_df, now: Optional[datetime] = None) -> bool:
+    """Return True if this signal is not a repeat of the last one we fired.
+
+    Per-instrument keys are keyed by (instrument, direction, H4 bar timestamp)
+    so a new UTC day's first bar always fires even if the direction is the same.
+    The ``now`` parameter is injected by ``_scan_instrument`` (real clock) or
+    test fixtures (controlled clock).
+    """
+    now = now or datetime.now(timezone.utc)
     key = _signal_key(instrument, signal, h4_df)
-    if _last_signal_key.get(instrument) == key:
+    stored = _last_signal_key.get(instrument)
+    if stored == key:
         return False
     _last_signal_key[instrument] = key
+    _persist_inflight_keys(_state_dir())
     return True
 
 
@@ -262,6 +301,13 @@ def _scan_instrument(
         )
         return
 
+    # Recovery notification — one-shot, fires on first scan after reconnect
+    pop_fn = getattr(bridge, "pop_reconnect_event", None)
+    if pop_fn is not None and pop_fn():
+        notifier.send_alert(
+            ":white_check_mark: *PRISM reconnected to MT5* — resuming live bar feed."
+        )
+
     # -- Data loading --
     # Live-bar path when the bridge is connected to MT5; cache-backed alias
     # path when running under MockMT5Bridge. The banner only fires on the
@@ -322,7 +368,7 @@ def _scan_instrument(
         logger.info("%s: No signal this scan", instrument)
         return
 
-    if not _should_fire(instrument, signal, h4_df):
+    if not _should_fire(instrument, signal, h4_df, now=now):
         logger.info(
             "%s: Signal %s suppressed — duplicate of last signal on this H4 bar",
             instrument, signal.direction,
@@ -468,13 +514,18 @@ def run() -> None:
 
     # Rehydrate the daily-brief guard from disk so a restart mid-day (crash,
     # deploy, etc.) doesn't double-send the 22:00 UTC summary.
-    global _last_brief_date
+    global _last_brief_date, _last_signal_key
     _last_brief_date = _load_last_brief_date()
     if _last_brief_date is not None:
         logger.info(
             "Loaded last_brief_date=%s from %s — brief will not re-fire today",
             _last_brief_date.isoformat(),
             _brief_state_file(),
+        )
+    _last_signal_key = _load_inflight_keys(_state_dir())
+    if _last_signal_key:
+        logger.info(
+            "Rehydrated in-flight signal keys: %s", list(_last_signal_key.keys())
         )
 
     logger.info(
